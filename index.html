@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inventory Scanner</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js"></script>
+  <style>
+    :root { --bg:#f6f7f9; --card:#fff; --text:#1a1d21; --muted:#6b7280; --ok:#15803d; --warn:#b45309; --bad:#b91c1c; --accent:#2563eb; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); }
+    main { max-width: 480px; margin: 0 auto; padding: 16px; }
+    h1 { font-size: 20px; margin: 4px 0 12px; }
+    .card { background:var(--card); border-radius:12px; padding:12px; margin-bottom:12px; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+    #reader { width:100%; }
+    button { font-size:16px; padding:12px 16px; border:0; border-radius:8px; background:var(--accent); color:#fff; width:100%; }
+    button.secondary { background:#e5e7eb; color:var(--text); }
+    .row { display:flex; gap:8px; margin-top:8px; }
+    input[type=text], input[type=password] { flex:1; min-width:0; font-size:16px; padding:12px; border:1px solid #d1d5db; border-radius:8px; }
+    #result { font-size:16px; padding:12px; border-radius:8px; display:none; word-break:break-word; }
+    #result.found { background:#dcfce7; color:var(--ok); display:block; }
+    #result.already { background:#fef3c7; color:var(--warn); display:block; }
+    #result.notfound, #result.error { background:#fee2e2; color:var(--bad); display:block; }
+    #result.checking { background:#e5e7eb; display:block; }
+    #result small { display:block; color:var(--text); margin-top:6px; opacity:.8; }
+    ul { list-style:none; padding:0; margin:0; font-size:14px; }
+    li { padding:6px 0; border-bottom:1px solid #eee; display:flex; justify-content:space-between; gap:8px; }
+    .tag { font-weight:600; }
+    .tag.found { color:var(--ok); } .tag.already { color:var(--warn); } .tag.notfound, .tag.error { color:var(--bad); }
+    .muted { color:var(--muted); font-size:13px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Inventory Scanner</h1>
+
+  <div class="card" id="tokenCard" style="display:none">
+    <div class="muted">Enter your access code (the API_TOKEN from your script). It is saved on this phone only.</div>
+    <div class="row">
+      <input id="tokenInput" type="password" placeholder="Access code" autocomplete="off">
+      <button id="tokenBtn" style="width:auto">Save</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div id="reader"></div>
+    <div class="row"><button id="toggleBtn">Start scanning</button></div>
+    <div class="row">
+      <button class="secondary" id="photoBtn">📷 Scan by taking a photo instead</button>
+      <input id="photoInput" type="file" accept="image/*" capture="environment" style="display:none">
+    </div>
+    <div id="fileHolder" style="display:none"></div>
+  </div>
+
+  <div class="card">
+    <div id="result"></div>
+    <div class="row">
+      <input id="manual" type="text" placeholder="Or type a property number" autocomplete="off">
+      <button class="secondary" id="manualBtn" style="width:auto">Mark</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="muted" id="count">Scanned this session: 0</div>
+    <ul id="log"></ul>
+    <div class="muted" style="margin-top:8px"><a href="#" id="changeToken">Change access code</a></div>
+  </div>
+</main>
+
+<script>
+  // ====== SETTING: paste your Apps Script web app URL (ends with /exec) ======
+  const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxod4yxkp-luWpYB-cJNXqKgrVLvEkqp3FFMzn3ctkrwOcqffa7_KQzTyYG8Sp2k59I4g/exec';
+  // ==========================================================================
+
+  const $ = id => document.getElementById(id);
+  let scanner = null, scanning = false, busy = false, lastCode = '', lastTime = 0, total = 0;
+
+  const getToken = () => { try { return localStorage.getItem('inv_token') || ''; } catch (e) { return window._tok || ''; } };
+  const setToken = t => { try { localStorage.setItem('inv_token', t); } catch (e) { window._tok = t; } };
+  if (!getToken()) $('tokenCard').style.display = 'block';
+
+  $('tokenBtn').onclick = () => {
+    const v = $('tokenInput').value.trim();
+    if (v) { setToken(v); $('tokenInput').value = ''; $('tokenCard').style.display = 'none'; }
+  };
+  $('changeToken').onclick = e => { e.preventDefault(); $('tokenCard').style.display = 'block'; };
+
+  // ---------- live scanner ----------
+  async function startScanner() {
+    if (!scanner) scanner = new Html5Qrcode('reader', {
+      formatsToSupport: [Html5QrcodeSupportedFormats.QR_CODE],
+      experimentalFeatures: { useBarCodeDetectorIfSupported: true }
+    });
+    try {
+      await scanner.start(
+        { facingMode: 'environment' },
+        { fps: 10, qrbox: (w, h) => { const s = Math.floor(Math.min(w, h) * 0.85); return { width: s, height: s }; } },
+        onScan,
+        () => {}
+      );
+      scanning = true;
+      $('toggleBtn').textContent = 'Stop scanning';
+    } catch (e) {
+      show('error', 'Camera unavailable (' + e + '). Allow camera access for this site in your browser settings, or use the photo button.');
+    }
+  }
+  async function stopScanner() {
+    if (scanner && scanning) await scanner.stop();
+    scanning = false;
+    $('toggleBtn').textContent = 'Start scanning';
+  }
+  $('toggleBtn').onclick = () => scanning ? stopScanner() : startScanner();
+
+  function onScan(text) {
+    const now = Date.now();
+    if (busy || (text === lastCode && now - lastTime < 3000)) return; // ignore repeat reads
+    lastCode = text; lastTime = now;
+    submit(text);
+  }
+
+  // ---------- photo fallback ----------
+  $('photoBtn').onclick = () => $('photoInput').click();
+  $('photoInput').onchange = async e => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (!file || busy) return;
+    show('checking', 'Reading QR code…');
+    try {
+      const small = await shrink(file);
+      submit(await new Html5Qrcode('fileHolder').scanFile(small, false));
+    } catch (err) {
+      show('error', 'No QR code found in that photo. Move closer, keep it flat and in focus, then try again.');
+    }
+  };
+  async function shrink(file) {
+    try {
+      const bmp = await createImageBitmap(file);
+      const k = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
+      c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+      const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.92));
+      return new File([blob], 'scan.jpg', { type: 'image/jpeg' });
+    } catch (e) { return file; }
+  }
+
+  // ---------- manual entry ----------
+  $('manualBtn').onclick = () => { const v = $('manual').value.trim(); if (v) submit(v); $('manual').value = ''; };
+  $('manual').addEventListener('keydown', e => { if (e.key === 'Enter') $('manualBtn').click(); });
+
+  // ---------- talk to Apps Script ----------
+  async function submit(code) {
+    if (busy) return;
+    if (SCRIPT_URL.indexOf('PASTE_') === 0) return show('error', 'Set SCRIPT_URL in index.html first.');
+    if (!getToken()) { $('tokenCard').style.display = 'block'; return show('error', 'Enter your access code first.'); }
+    busy = true;
+    show('checking', 'Checking…');
+    try {
+      // text/plain avoids a CORS preflight, which Apps Script does not support
+      const res = await fetch(SCRIPT_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ token: getToken(), code: code })
+      });
+      render(await res.json(), code);
+    } catch (e) {
+      render({ status: 'error', message: 'Network error: ' + e.message }, code);
+    }
+    busy = false;
+  }
+
+  function render(r, code) {
+    let msg;
+    if (r.status === 'found') msg = '✔ FOUND: ' + r.code;
+    else if (r.status === 'already') msg = 'Already marked FOUND: ' + r.code;
+    else if (r.status === 'notfound') msg = '✖ Not in database: ' + r.code;
+    else msg = 'Error: ' + (r.message || 'unknown');
+    if (r.message === 'Invalid access code.') $('tokenCard').style.display = 'block';
+    const detail = r.details ? Object.entries(r.details).slice(0, 4).map(([k, v]) => k + ': ' + v).join(' · ') : '';
+    show(r.status, msg, detail);
+    if (navigator.vibrate) navigator.vibrate(r.status === 'found' ? 80 : [80, 60, 80]);
+
+    total++;
+    $('count').textContent = 'Scanned this session: ' + total;
+    const li = document.createElement('li');
+    li.innerHTML = '<span></span><span class="tag ' + r.status + '"></span>';
+    li.children[0].textContent = r.code || String(code).slice(0, 40);
+    li.children[1].textContent = r.status.toUpperCase();
+    $('log').prepend(li);
+  }
+
+  function show(cls, msg, detail) {
+    const el = $('result');
+    el.className = cls;
+    el.textContent = msg;
+    if (detail) { const s = document.createElement('small'); s.textContent = detail; el.appendChild(s); }
+  }
+</script>
+</body>
+</html>
