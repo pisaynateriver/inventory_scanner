@@ -15,10 +15,13 @@
     #reader { width:100%; }
     button { font-size:16px; padding:12px 16px; border:0; border-radius:8px; background:var(--accent); color:#fff; width:100%; }
     button.secondary { background:#e5e7eb; color:var(--text); }
+    button.danger { background:#fee2e2; color:var(--bad); }
+    button:disabled { opacity:.6; }
     .row { display:flex; gap:8px; margin-top:8px; }
-    input[type=text], input[type=password] { flex:1; min-width:0; font-size:16px; padding:12px; border:1px solid #d1d5db; border-radius:8px; }
+    input[type=text], input[type=password], textarea { flex:1; min-width:0; font-size:16px; padding:12px; border:1px solid #d1d5db; border-radius:8px; font-family:inherit; }
+    textarea { resize:vertical; }
     #result { font-size:16px; padding:12px; border-radius:8px; display:none; word-break:break-word; }
-    #result.found { background:#dcfce7; color:var(--ok); display:block; }
+    #result.found, #result.saved { background:#dcfce7; color:var(--ok); display:block; }
     #result.already { background:#fef3c7; color:var(--warn); display:block; }
     #result.notfound, #result.error { background:#fee2e2; color:var(--bad); display:block; }
     #result.checking { background:#e5e7eb; display:block; }
@@ -26,8 +29,18 @@
     ul { list-style:none; padding:0; margin:0; font-size:14px; }
     li { padding:6px 0; border-bottom:1px solid #eee; display:flex; justify-content:space-between; gap:8px; }
     .tag { font-weight:600; }
-    .tag.found { color:var(--ok); } .tag.already { color:var(--warn); } .tag.notfound, .tag.error { color:var(--bad); }
+    .tag.found, .tag.saved { color:var(--ok); } .tag.already { color:var(--warn); } .tag.notfound, .tag.error { color:var(--bad); }
     .muted { color:var(--muted); font-size:13px; }
+    label { display:block; font-size:13px; font-weight:600; margin:10px 0 4px; color:#374151; }
+    label.new-field { color:var(--accent); }
+
+    /* Modal */
+    #overlay { position:fixed; inset:0; background:rgba(0,0,0,.5); display:none; align-items:flex-end; justify-content:center; z-index:50; }
+    #overlay.open { display:flex; }
+    #modal { background:var(--card); width:100%; max-width:480px; max-height:92vh; overflow-y:auto; border-radius:16px 16px 0 0; padding:16px; }
+    #modal h2 { margin:0 0 4px; font-size:18px; }
+    #modal .sub { color:var(--muted); font-size:13px; margin-bottom:8px; }
+    .modal-actions { display:flex; gap:8px; margin-top:16px; position:sticky; bottom:0; background:var(--card); padding-top:8px; }
   </style>
 </head>
 <body>
@@ -46,7 +59,7 @@
     <div id="reader"></div>
     <div class="row"><button id="toggleBtn">Start scanning</button></div>
     <div class="row">
-      <button class="secondary" id="photoBtn">📷 Scan by taking a photo instead</button>
+      <button class="secondary" id="photoBtn">Scan by taking a photo instead</button>
       <input id="photoInput" type="file" accept="image/*" capture="environment" style="display:none">
     </div>
     <div id="fileHolder" style="display:none"></div>
@@ -56,7 +69,7 @@
     <div id="result"></div>
     <div class="row">
       <input id="manual" type="text" placeholder="Or type a property number" autocomplete="off">
-      <button class="secondary" id="manualBtn" style="width:auto">Mark</button>
+      <button class="secondary" id="manualBtn" style="width:auto">Look up</button>
     </div>
   </div>
 
@@ -67,13 +80,32 @@
   </div>
 </main>
 
+<div id="overlay">
+  <div id="modal">
+    <h2>Review item</h2>
+    <div class="sub" id="modalSub"></div>
+    <div id="modalFields"></div>
+    <label class="new-field">NEW ICS</label>
+    <input type="text" id="f_newIcs">
+    <label class="new-field" id="remarksLabel">Inventory remarks</label>
+    <textarea id="f_remarks" rows="2" placeholder="Leave blank to just mark FOUND"></textarea>
+    <div class="modal-actions">
+      <button class="secondary" id="cancelBtn" style="width:auto;flex:1">Cancel</button>
+      <button id="saveBtn" style="flex:2">Mark FOUND / Save</button>
+    </div>
+  </div>
+</div>
+
 <script>
   // ====== SETTING: paste your Apps Script web app URL (ends with /exec) ======
-  const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxod4yxkp-luWpYB-cJNXqKgrVLvEkqp3FFMzn3ctkrwOcqffa7_KQzTyYG8Sp2k59I4g/exec';
+  const SCRIPT_URL = 'PASTE_YOUR_WEB_APP_URL_HERE';
   // ==========================================================================
+
+  const MODAL_HEADERS = ['ARTICLE', 'ICS', 'SERIAL NUMBER', 'PROPERTY NUMBER', 'DESCRIPTION', 'ACTUAL LOCATION', 'ACCOUNTABLE PERSON', 'REMARKS'];
 
   const $ = id => document.getElementById(id);
   let scanner = null, scanning = false, busy = false, lastCode = '', lastTime = 0, total = 0;
+  let pending = null; // { row, originalCode } for the item currently open in the modal
 
   const getToken = () => { try { return localStorage.getItem('inv_token') || ''; } catch (e) { return window._tok || ''; } };
   const setToken = t => { try { localStorage.setItem('inv_token', t); } catch (e) { window._tok = t; } };
@@ -84,6 +116,17 @@
     if (v) { setToken(v); $('tokenInput').value = ''; $('tokenCard').style.display = 'none'; }
   };
   $('changeToken').onclick = e => { e.preventDefault(); $('tokenCard').style.display = 'block'; };
+
+  // ---------- build modal field inputs once ----------
+  MODAL_HEADERS.forEach(h => {
+    const label = document.createElement('label');
+    label.textContent = h;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.id = 'f_' + h.replace(/\s+/g, '_');
+    $('modalFields').appendChild(label);
+    $('modalFields').appendChild(input);
+  });
 
   // ---------- live scanner ----------
   async function startScanner() {
@@ -113,9 +156,9 @@
 
   function onScan(text) {
     const now = Date.now();
-    if (busy || (text === lastCode && now - lastTime < 3000)) return; // ignore repeat reads
+    if (busy || modalOpen() || (text === lastCode && now - lastTime < 3000)) return; // ignore repeat reads / while reviewing
     lastCode = text; lastTime = now;
-    submit(text);
+    lookup(text);
   }
 
   // ---------- photo fallback ----------
@@ -124,10 +167,10 @@
     const file = e.target.files[0];
     e.target.value = '';
     if (!file || busy) return;
-    show('checking', 'Reading QR code…');
+    show('checking', 'Reading QR code...');
     try {
       const small = await shrink(file);
-      submit(await new Html5Qrcode('fileHolder').scanFile(small, false));
+      lookup(await new Html5Qrcode('fileHolder').scanFile(small, false));
     } catch (err) {
       show('error', 'No QR code found in that photo. Move closer, keep it flat and in focus, then try again.');
     }
@@ -145,40 +188,100 @@
   }
 
   // ---------- manual entry ----------
-  $('manualBtn').onclick = () => { const v = $('manual').value.trim(); if (v) submit(v); $('manual').value = ''; };
+  $('manualBtn').onclick = () => { const v = $('manual').value.trim(); if (v) lookup(v); $('manual').value = ''; };
   $('manual').addEventListener('keydown', e => { if (e.key === 'Enter') $('manualBtn').click(); });
 
-  // ---------- talk to Apps Script ----------
-  async function submit(code) {
+  // ---------- step 1: lookup, then open modal ----------
+  async function lookup(scannedText) {
     if (busy) return;
     if (SCRIPT_URL.indexOf('PASTE_') === 0) return show('error', 'Set SCRIPT_URL in index.html first.');
     if (!getToken()) { $('tokenCard').style.display = 'block'; return show('error', 'Enter your access code first.'); }
     busy = true;
-    show('checking', 'Checking…');
+    show('checking', 'Looking up...');
     try {
-      // text/plain avoids a CORS preflight, which Apps Script does not support
-      const res = await fetch(SCRIPT_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({ token: getToken(), code: code })
-      });
-      render(await res.json(), code);
+      const r = await callApi({ action: 'lookup', code: scannedText });
+      if (r.status === 'ok') {
+        openModal(r);
+        $('result').style.display = 'none';
+      } else {
+        logResult(r, scannedText);
+      }
     } catch (e) {
-      render({ status: 'error', message: 'Network error: ' + e.message }, code);
+      logResult({ status: 'error', message: 'Network error: ' + e.message }, scannedText);
     }
     busy = false;
   }
 
-  function render(r, code) {
+  function openModal(r) {
+    pending = { row: r.row, originalCode: r.code };
+    $('modalSub').textContent = r.code + (r.alreadyFound ? '  -  already marked in Inventory_' + currentYear() : '');
+    MODAL_HEADERS.forEach(h => { $('f_' + h.replace(/\s+/g, '_')).value = r.fields[h] || ''; });
+    $('f_newIcs').value = r.newIcs || '';
+    $('f_remarks').value = r.inventoryRemarks || '';
+    $('remarksLabel').textContent = 'Inventory remarks (Inventory_' + currentYear() + ' - blank = "FOUND")';
+    if (scanning) scanner.pause(true);
+    $('overlay').classList.add('open');
+  }
+
+  function currentYear() { return new Date().getFullYear(); }
+
+  function closeModal(resume) {
+    $('overlay').classList.remove('open');
+    pending = null;
+    if (resume && scanning) scanner.resume();
+  }
+  $('cancelBtn').onclick = () => closeModal(true);
+
+  // ---------- step 2: save from modal ----------
+  $('saveBtn').onclick = async () => {
+    if (!pending || busy) return;
+    busy = true;
+    $('saveBtn').disabled = true;
+    const fields = {};
+    MODAL_HEADERS.forEach(h => { fields[h] = $('f_' + h.replace(/\s+/g, '_')).value; });
+    try {
+      const r = await callApi({
+        action: 'save',
+        row: pending.row,
+        code: pending.originalCode,
+        fields: fields,
+        newIcs: $('f_newIcs').value,
+        inventoryRemarks: $('f_remarks').value
+      });
+      closeModal(false);
+      logResult(r, pending.originalCode);
+      if (r.status === 'saved' && scanning) scanner.resume();
+    } catch (e) {
+      closeModal(false);
+      logResult({ status: 'error', message: 'Network error: ' + e.message }, pending ? pending.originalCode : '');
+      if (scanning) scanner.resume();
+    }
+    busy = false;
+    $('saveBtn').disabled = false;
+  };
+
+  function modalOpen() { return $('overlay').classList.contains('open'); }
+
+  // ---------- talk to Apps Script ----------
+  async function callApi(payload) {
+    payload.token = getToken();
+    // text/plain avoids a CORS preflight, which Apps Script does not support
+    const res = await fetch(SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload)
+    });
+    return res.json();
+  }
+
+  function logResult(r, code) {
     let msg;
-    if (r.status === 'found') msg = '✔ FOUND: ' + r.code;
-    else if (r.status === 'already') msg = 'Already marked FOUND: ' + r.code;
-    else if (r.status === 'notfound') msg = '✖ Not in database: ' + r.code;
+    if (r.status === 'saved') msg = 'Saved: ' + r.code + '  ->  ' + r.column + ' = "' + r.value + '"';
+    else if (r.status === 'notfound') msg = 'Not in database: ' + r.code;
     else msg = 'Error: ' + (r.message || 'unknown');
     if (r.message === 'Invalid access code.') $('tokenCard').style.display = 'block';
-    const detail = r.details ? Object.entries(r.details).slice(0, 4).map(([k, v]) => k + ': ' + v).join(' · ') : '';
-    show(r.status, msg, detail);
-    if (navigator.vibrate) navigator.vibrate(r.status === 'found' ? 80 : [80, 60, 80]);
+    show(r.status, msg);
+    if (navigator.vibrate) navigator.vibrate(r.status === 'saved' ? 80 : [80, 60, 80]);
 
     total++;
     $('count').textContent = 'Scanned this session: ' + total;
